@@ -220,7 +220,8 @@ async def run_scan(options, cache) -> list["JobPosting"]:
         completed += 1
         if exc is not None:
             console.print(
-                f"[{completed}/{len(scrapers)}] {source_name}: skipped after {elapsed:.1f}s ({type(exc).__name__})"
+                f"[{completed}/{len(scrapers)}] {source_name}: skipped after {elapsed:.1f}s "
+                f"({_format_exception(exc)})"
             )
             continue
         console.print(f"[{completed}/{len(scrapers)}] {source_name}: {len(result)} jobs in {elapsed:.1f}s")
@@ -327,6 +328,15 @@ def _missing_core_dependencies() -> list[str]:
         except ImportError:
             missing.append(package_name)
     return missing
+
+
+def _format_exception(exc: Exception) -> str:
+    message = " ".join(str(exc).split())
+    if "Executable doesn't exist" in message and "playwright" in message.lower():
+        return "Playwright browser missing; run '.venv/bin/python -m playwright install chromium'"
+    if message:
+        return f"{type(exc).__name__}: {_truncate(message, 120)}"
+    return type(exc).__name__
 
 
 if __name__ == "__main__":

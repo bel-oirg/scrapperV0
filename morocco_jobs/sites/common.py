@@ -81,22 +81,29 @@ class RemoteOKApiScraper(BaseScraper):
 
 
 class PortfolioNetworkScraper(CareerPageScraper):
-    company_limit = 12
-    candidate_paths = ("/careers", "/jobs", "/join-us", "/joinus", "/careers/jobs")
+    company_limit = 4
+    candidate_paths = ("/careers", "/jobs", "/join-us")
 
-    def extract_jobs_from_listing(self, html: str, url: str) -> list[JobPosting]:
-        jobs = super().extract_jobs_from_listing(html, url)
+    def extract_jobs_from_listing(
+        self,
+        html: str,
+        url: str,
+        options: SearchOptions | None = None,
+    ) -> list[JobPosting]:
+        jobs = super().extract_jobs_from_listing(html, url, options)
         if jobs:
             return jobs
         soup = self._soup(html)
         company_links: list[str] = []
+        seen_links: set[str] = set()
         for anchor in soup.find_all("a", href=True):
             href = anchor.get("href", "")
             if href.startswith("mailto:"):
                 continue
             absolute = urljoin(url, href)
-            if absolute.startswith("http"):
+            if absolute.startswith("http") and absolute not in seen_links:
                 company_links.append(absolute)
+                seen_links.add(absolute)
             if len(company_links) >= self.company_limit:
                 break
         discovered: list[JobPosting] = []
@@ -106,7 +113,7 @@ class PortfolioNetworkScraper(CareerPageScraper):
                 job_page = self.fetch_text(candidate)
                 if not job_page:
                     continue
-                discovered.extend(super().extract_jobs_from_listing(job_page, candidate))
+                discovered.extend(super().extract_jobs_from_listing(job_page, candidate, options))
                 if len(discovered) >= self.max_jobs:
                     return discovered
         return discovered
