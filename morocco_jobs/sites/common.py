@@ -17,13 +17,14 @@ class CareerPageScraper(ConfiguredScraper):
     query_mode = "boolean"
     max_jobs = 25
 
-    def discovery_urls(self, planner) -> list[str]:
+    def discovery_urls(self, planner, options=None) -> list[str]:
         return list(self.start_urls)
 
 
 class PlaywrightConfiguredScraper(ConfiguredScraper):
     use_playwright = True
     max_jobs = 25
+    max_discovery_urls = 4
 
 
 class RemoteOKApiScraper(BaseScraper):

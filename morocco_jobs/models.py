@@ -70,6 +70,7 @@ class SearchOptions:
     notify: bool = False
     watch: bool = False
     apply_template: bool = False
+    deep_scan: bool = False
 
 
 @dataclass(slots=True)

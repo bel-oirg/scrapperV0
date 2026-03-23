@@ -228,6 +228,18 @@ class SearchPlanner:
                     )
         return queries
 
+    def iter_compact_queries(self) -> list[str]:
+        queries: list[str] = []
+        tech_groups = self._chunks(self.tech, 8) or [self.tech]
+        culture_group = self.culture[:6] if self.culture else []
+        for role_group in self._chunks(self.roles, 4):
+            for tech_group in tech_groups:
+                parts = [self._or_group(role_group), self._or_group(tech_group)]
+                if culture_group:
+                    parts.append(self._or_group(culture_group))
+                queries.append(" ".join(parts))
+        return queries
+
     def iter_role_queries(self) -> list[str]:
         return list(self.roles)
 
@@ -238,6 +250,8 @@ class SearchPlanner:
         return [f"{role} {tech} {culture}" for role in self.roles for tech in self.tech for culture in self.culture]
 
     def queries_for_mode(self, mode: str) -> list[str]:
+        if mode == "compact":
+            return self.iter_compact_queries()
         if mode == "cartesian":
             return self.iter_cartesian_queries()
         if mode == "roles":

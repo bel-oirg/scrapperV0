@@ -39,11 +39,12 @@ class BaseScraper(ABC):
     base_url = ""
     start_urls: tuple[str, ...] = ()
     search_templates: tuple[str, ...] = ()
-    query_mode = "boolean"
+    query_mode = "compact"
     use_playwright = False
     max_listings_per_page = 12
     max_jobs = 40
     timeout = 25
+    max_discovery_urls = 6
     allowed_external_domains: tuple[str, ...] = ()
     job_link_markers = (
         "job",
@@ -74,15 +75,15 @@ class BaseScraper(ABC):
 
     def scrape_sync(self, planner: SearchPlanner, options: SearchOptions) -> list[JobPosting]:
         jobs: dict[str, JobPosting] = {}
-        for url in self.discovery_urls(planner):
-            if len(jobs) >= self.max_jobs:
+        for url in self.discovery_urls(planner, options):
+            if len(jobs) >= self.job_limit(options):
                 break
             html = self.fetch_text(url)
             if not html:
                 continue
-            for job in self.extract_jobs_from_listing(html, url):
+            for job in self.extract_jobs_from_listing(html, url, options):
                 jobs.setdefault(job.dedup_key, job)
-                if len(jobs) >= self.max_jobs:
+                if len(jobs) >= self.job_limit(options):
                     break
         return list(jobs.values())
 
@@ -111,8 +112,8 @@ class BaseScraper(ABC):
                 """
             )
             page = await context.new_page()
-            for url in self.discovery_urls(planner):
-                if len(jobs) >= self.max_jobs:
+            for url in self.discovery_urls(planner, options):
+                if len(jobs) >= self.job_limit(options):
                     break
                 try:
                     await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
@@ -120,22 +121,43 @@ class BaseScraper(ABC):
                     html = await page.content()
                 except Exception:
                     continue
-                for job in self.extract_jobs_from_listing(html, url):
+                for job in self.extract_jobs_from_listing(html, url, options):
                     jobs.setdefault(job.dedup_key, job)
-                    if len(jobs) >= self.max_jobs:
+                    if len(jobs) >= self.job_limit(options):
                         break
             await context.close()
             await browser.close()
         return list(jobs.values())
 
-    def discovery_urls(self, planner: SearchPlanner) -> list[str]:
+    def discovery_urls(self, planner: SearchPlanner, options: SearchOptions | None = None) -> list[str]:
         urls = list(self.start_urls)
-        queries = planner.queries_for_mode(self.query_mode)
+        query_mode = self.query_mode
+        if options and options.deep_scan and self.search_templates:
+            query_mode = "boolean"
+        queries = planner.queries_for_mode(query_mode)
+        limit = self.discovery_limit(options)
+        if limit:
+            queries = queries[:limit]
         for template in self.search_templates:
             for query in queries:
                 encoded = quote_plus(query)
                 urls.append(template.format(query=encoded, raw_query=query, location="Morocco", country="MA"))
         return urls
+
+    def discovery_limit(self, options: SearchOptions | None) -> int:
+        if options and options.deep_scan:
+            return 0
+        return self.max_discovery_urls
+
+    def listings_limit(self, options: SearchOptions | None) -> int:
+        if options and options.deep_scan:
+            return max(self.max_listings_per_page, 30)
+        return self.max_listings_per_page
+
+    def job_limit(self, options: SearchOptions | None) -> int:
+        if options and options.deep_scan:
+            return max(self.max_jobs, 100)
+        return self.max_jobs
 
     def fetch_text(self, url: str) -> str | None:
         parsed = urlparse(url)
@@ -182,7 +204,7 @@ class BaseScraper(ABC):
         except Exception:
             return True
 
-    def extract_jobs_from_listing(self, html: str, url: str) -> list[JobPosting]:
+    def extract_jobs_from_listing(self, html: str, url: str, options: SearchOptions | None = None) -> list[JobPosting]:
         soup = BeautifulSoup(html, "html.parser")
         schema_jobs = self.extract_schema_jobs(soup, url)
         if schema_jobs:
@@ -198,14 +220,14 @@ class BaseScraper(ABC):
             if not self.looks_like_job_link(href, link_text):
                 continue
             candidates.append((href, link_text))
-            if len(candidates) >= self.max_listings_per_page:
+            if len(candidates) >= self.listings_limit(options):
                 break
 
         for href, link_text in candidates:
             job = self.parse_job_page(href, hint_title=link_text)
             if job:
                 jobs.append(job)
-            if len(jobs) >= self.max_jobs:
+            if len(jobs) >= self.job_limit(options):
                 break
         return jobs
 

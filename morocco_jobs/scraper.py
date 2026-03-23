@@ -25,6 +25,7 @@ def get_console():
 
 
 console = get_console()
+SOURCE_TIMEOUT_SECONDS = 90
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -38,6 +39,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--notify", action="store_true", help="Print summary and play beep.")
     parser.add_argument("--watch", action="store_true", help="Re-run every 6h and notify only new jobs.")
     parser.add_argument("--apply-template", action="store_true", help="Print a pre-filled cover letter template for the best match.")
+    parser.add_argument("--deep-scan", action="store_true", help="Run a much larger scan across more queries and listings per source.")
     return parser.parse_args(argv)
 
 
@@ -70,6 +72,7 @@ def build_options(args: argparse.Namespace):
         notify=args.notify,
         watch=args.watch,
         apply_template=args.apply_template,
+        deep_scan=args.deep_scan,
     )
 
 
@@ -112,7 +115,7 @@ def score_and_filter(jobs: Iterable["JobPosting"], options) -> list["JobPosting"
     )
 
 
-def render_jobs(jobs: list["JobPosting"]) -> None:
+def render_jobs(jobs: list["JobPosting"], min_score: int = 4) -> None:
     try:
         from rich.table import Table
     except ImportError:  # pragma: no cover - used before dependencies are installed.
@@ -123,6 +126,11 @@ def render_jobs(jobs: list["JobPosting"]) -> None:
         ("💼 Good fits", [job for job in jobs if 6 <= job.relevance_score <= 7]),
         ("👀 Worth checking", [job for job in jobs if 4 <= job.relevance_score <= 5]),
     ]
+    if min_score < 4:
+        groups.append(("🧪 Low-signal but scraped", [job for job in jobs if 0 <= job.relevance_score <= 3]))
+    if not any(items for _, items in groups):
+        console.print("No matches above the current filters yet.")
+        return
     for label, items in groups:
         if not items:
             continue
@@ -190,12 +198,32 @@ async def run_scan(options, cache) -> list["JobPosting"]:
     planner = SearchPlanner(DEFAULT_PROFILE, options.keywords_override)
     registry = build_registry()
     scrapers = [registry[name](DEFAULT_PROFILE, cache) for name in options.sites if name in registry]
-    results = await asyncio.gather(*(scraper.scrape(planner, options) for scraper in scrapers), return_exceptions=True)
+    scan_mode = "deep scan" if options.deep_scan else "standard scan"
+    console.print(f"Scanning {len(scrapers)} sources with {scan_mode}...")
+
+    async def run_one(scraper):
+        started_at = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(scraper.scrape(planner, options), timeout=SOURCE_TIMEOUT_SECONDS)
+            elapsed = time.perf_counter() - started_at
+            return scraper.name, result, elapsed, None
+        except Exception as exc:
+            elapsed = time.perf_counter() - started_at
+            return scraper.name, [], elapsed, exc
+
+    tasks = [asyncio.create_task(run_one(scraper)) for scraper in scrapers]
 
     collected: list["JobPosting"] = []
-    for result in results:
-        if isinstance(result, Exception):
+    completed = 0
+    for task in asyncio.as_completed(tasks):
+        source_name, result, elapsed, exc = await task
+        completed += 1
+        if exc is not None:
+            console.print(
+                f"[{completed}/{len(scrapers)}] {source_name}: skipped after {elapsed:.1f}s ({type(exc).__name__})"
+            )
             continue
+        console.print(f"[{completed}/{len(scrapers)}] {source_name}: {len(result)} jobs in {elapsed:.1f}s")
         collected.extend(result)
 
     filtered = score_and_filter(collected, options)
@@ -225,8 +253,9 @@ def run_once(options: SearchOptions) -> list[JobPosting]:
     from .notifier import notify, render_summary
 
     cache = SQLiteCache()
+    console.print("Starting job scan...")
     jobs = asyncio.run(run_scan(options, cache))
-    render_jobs(jobs)
+    render_jobs(jobs, options.min_score)
     render_summary(console, jobs)
     export_if_needed(jobs, options)
     if options.notify:
