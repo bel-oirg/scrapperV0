@@ -40,6 +40,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--watch", action="store_true", help="Re-run every 6h and notify only new jobs.")
     parser.add_argument("--apply-template", action="store_true", help="Print a pre-filled cover letter template for the best match.")
     parser.add_argument("--deep-scan", action="store_true", help="Run a much larger scan across more queries and listings per source.")
+    parser.add_argument("--source-timeout", type=int, default=SOURCE_TIMEOUT_SECONDS, help="Per-source timeout in seconds.")
     return parser.parse_args(argv)
 
 
@@ -73,6 +74,7 @@ def build_options(args: argparse.Namespace):
         watch=args.watch,
         apply_template=args.apply_template,
         deep_scan=args.deep_scan,
+        source_timeout_seconds=args.source_timeout,
     )
 
 
@@ -204,7 +206,7 @@ async def run_scan(options, cache) -> list["JobPosting"]:
     async def run_one(scraper):
         started_at = time.perf_counter()
         try:
-            result = await asyncio.wait_for(scraper.scrape(planner, options), timeout=SOURCE_TIMEOUT_SECONDS)
+            result = await scraper.scrape(planner, options)
             elapsed = time.perf_counter() - started_at
             return scraper.name, result, elapsed, None
         except Exception as exc:
@@ -333,7 +335,7 @@ def _missing_core_dependencies() -> list[str]:
 def _format_exception(exc: Exception) -> str:
     message = " ".join(str(exc).split())
     if "Executable doesn't exist" in message and "playwright" in message.lower():
-        return "Playwright browser missing; run '.venv/bin/python -m playwright install chromium'"
+        return "Playwright browser missing; run 'python -m playwright install chromium' in the same environment"
     if message:
         return f"{type(exc).__name__}: {_truncate(message, 120)}"
     return type(exc).__name__

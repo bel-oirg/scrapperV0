@@ -69,29 +69,42 @@ class BaseScraper(ABC):
         self._robots: dict[str, RobotFileParser] = {}
 
     async def scrape(self, planner: SearchPlanner, options: SearchOptions) -> list[JobPosting]:
+        deadline = time.monotonic() + max(1, options.source_timeout_seconds)
         if self.use_playwright:
-            return await self.scrape_playwright(planner, options)
-        return await asyncio.to_thread(self.scrape_sync, planner, options)
+            return await self.scrape_playwright(planner, options, deadline)
+        return await asyncio.to_thread(self.scrape_sync, planner, options, deadline)
 
-    def scrape_sync(self, planner: SearchPlanner, options: SearchOptions) -> list[JobPosting]:
+    def scrape_sync(
+        self,
+        planner: SearchPlanner,
+        options: SearchOptions,
+        deadline: float | None = None,
+    ) -> list[JobPosting]:
         jobs: dict[str, JobPosting] = {}
         for url in self.discovery_urls(planner, options):
+            if self._deadline_reached(deadline):
+                break
             if len(jobs) >= self.job_limit(options):
                 break
-            html = self.fetch_text(url)
+            html = self.fetch_text(url, deadline)
             if not html:
                 continue
-            for job in self.extract_jobs_from_listing(html, url, options):
+            for job in self.extract_jobs_from_listing(html, url, options, deadline):
                 jobs.setdefault(job.dedup_key, job)
                 if len(jobs) >= self.job_limit(options):
                     break
         return list(jobs.values())
 
-    async def scrape_playwright(self, planner: SearchPlanner, options: SearchOptions) -> list[JobPosting]:
+    async def scrape_playwright(
+        self,
+        planner: SearchPlanner,
+        options: SearchOptions,
+        deadline: float | None = None,
+    ) -> list[JobPosting]:
         try:
             from playwright.async_api import async_playwright
         except ImportError:
-            return await asyncio.to_thread(self.scrape_sync, planner, options)
+            return await asyncio.to_thread(self.scrape_sync, planner, options, deadline)
 
         jobs: dict[str, JobPosting] = {}
         async with async_playwright() as playwright:
@@ -113,15 +126,28 @@ class BaseScraper(ABC):
             )
             page = await context.new_page()
             for url in self.discovery_urls(planner, options):
+                if self._deadline_reached(deadline):
+                    break
                 if len(jobs) >= self.job_limit(options):
                     break
                 try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
-                    await page.wait_for_timeout(random.randint(1500, 4000))
+                    remaining_ms = self._remaining_ms(deadline)
+                    if remaining_ms is not None and remaining_ms <= 0:
+                        break
+                    await page.goto(
+                        url,
+                        wait_until="domcontentloaded",
+                        timeout=min(self.timeout * 1000, remaining_ms) if remaining_ms else self.timeout * 1000,
+                    )
+                    wait_ms = random.randint(1500, 4000)
+                    if remaining_ms is not None:
+                        wait_ms = max(0, min(wait_ms, remaining_ms))
+                    if wait_ms:
+                        await page.wait_for_timeout(wait_ms)
                     html = await page.content()
                 except Exception:
                     continue
-                for job in self.extract_jobs_from_listing(html, url, options):
+                for job in self.extract_jobs_from_listing(html, url, options, deadline):
                     jobs.setdefault(job.dedup_key, job)
                     if len(jobs) >= self.job_limit(options):
                         break
@@ -159,9 +185,11 @@ class BaseScraper(ABC):
             return max(self.max_jobs, 100)
         return self.max_jobs
 
-    def fetch_text(self, url: str) -> str | None:
+    def fetch_text(self, url: str, deadline: float | None = None) -> str | None:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
+            return None
+        if self._deadline_reached(deadline):
             return None
         if not self.allowed_by_robots(url):
             return None
@@ -173,11 +201,24 @@ class BaseScraper(ABC):
 
         for attempt in range(3):
             try:
-                time.sleep(random.uniform(1.5, 4.0))
+                if self._deadline_reached(deadline):
+                    return None
+                delay = random.uniform(1.5, 4.0)
+                remaining_seconds = self._remaining_seconds(deadline)
+                if remaining_seconds is not None:
+                    delay = min(delay, max(0.0, remaining_seconds))
+                if delay > 0:
+                    time.sleep(delay)
+                remaining_seconds = self._remaining_seconds(deadline)
+                request_timeout = self.timeout
+                if remaining_seconds is not None:
+                    if remaining_seconds <= 0:
+                        return None
+                    request_timeout = max(1.0, min(float(self.timeout), remaining_seconds))
                 response = self.session.get(
                     url,
                     headers={"User-Agent": random.choice(USER_AGENTS)},
-                    timeout=self.timeout,
+                    timeout=request_timeout,
                 )
                 if response.status_code >= 400:
                     raise requests.HTTPError(f"{response.status_code} for {url}")
@@ -185,7 +226,12 @@ class BaseScraper(ABC):
                 self.cache.set_response(cache_key, url, response.text, response.status_code)
                 return response.text
             except Exception:
-                time.sleep(2**attempt)
+                remaining_seconds = self._remaining_seconds(deadline)
+                backoff = float(2**attempt)
+                if remaining_seconds is not None:
+                    backoff = min(backoff, max(0.0, remaining_seconds))
+                if backoff > 0:
+                    time.sleep(backoff)
         return None
 
     def allowed_by_robots(self, url: str) -> bool:
@@ -204,7 +250,13 @@ class BaseScraper(ABC):
         except Exception:
             return True
 
-    def extract_jobs_from_listing(self, html: str, url: str, options: SearchOptions | None = None) -> list[JobPosting]:
+    def extract_jobs_from_listing(
+        self,
+        html: str,
+        url: str,
+        options: SearchOptions | None = None,
+        deadline: float | None = None,
+    ) -> list[JobPosting]:
         soup = BeautifulSoup(html, "html.parser")
         schema_jobs = self.extract_schema_jobs(soup, url)
         if schema_jobs:
@@ -224,7 +276,9 @@ class BaseScraper(ABC):
                 break
 
         for href, link_text in candidates:
-            job = self.parse_job_page(href, hint_title=link_text)
+            if self._deadline_reached(deadline):
+                break
+            job = self.parse_job_page(href, hint_title=link_text, deadline=deadline)
             if job:
                 jobs.append(job)
             if len(jobs) >= self.job_limit(options):
@@ -240,8 +294,13 @@ class BaseScraper(ABC):
         haystack = f"{href.lower()} {link_text.lower()}"
         return any(marker in haystack for marker in self.job_link_markers)
 
-    def parse_job_page(self, url: str, hint_title: str = "") -> JobPosting | None:
-        html = self.fetch_text(url)
+    def parse_job_page(
+        self,
+        url: str,
+        hint_title: str = "",
+        deadline: float | None = None,
+    ) -> JobPosting | None:
+        html = self.fetch_text(url, deadline)
         if not html:
             return None
         soup = BeautifulSoup(html, "html.parser")
@@ -426,3 +485,21 @@ class BaseScraper(ABC):
                 if address.get(field)
             )
         )
+
+    @staticmethod
+    def _remaining_seconds(deadline: float | None) -> float | None:
+        if deadline is None:
+            return None
+        return deadline - time.monotonic()
+
+    @classmethod
+    def _remaining_ms(cls, deadline: float | None) -> int | None:
+        remaining = cls._remaining_seconds(deadline)
+        if remaining is None:
+            return None
+        return max(0, int(remaining * 1000))
+
+    @classmethod
+    def _deadline_reached(cls, deadline: float | None) -> bool:
+        remaining = cls._remaining_seconds(deadline)
+        return remaining is not None and remaining <= 0

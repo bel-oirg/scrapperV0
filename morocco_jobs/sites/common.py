@@ -89,8 +89,9 @@ class PortfolioNetworkScraper(CareerPageScraper):
         html: str,
         url: str,
         options: SearchOptions | None = None,
+        deadline: float | None = None,
     ) -> list[JobPosting]:
-        jobs = super().extract_jobs_from_listing(html, url, options)
+        jobs = super().extract_jobs_from_listing(html, url, options, deadline)
         if jobs:
             return jobs
         soup = self._soup(html)
@@ -110,10 +111,12 @@ class PortfolioNetworkScraper(CareerPageScraper):
         for company_url in company_links:
             for path in self.candidate_paths:
                 candidate = urljoin(company_url, path)
-                job_page = self.fetch_text(candidate)
+                if self._deadline_reached(deadline):
+                    return discovered
+                job_page = self.fetch_text(candidate, deadline)
                 if not job_page:
                     continue
-                discovered.extend(super().extract_jobs_from_listing(job_page, candidate, options))
+                discovered.extend(super().extract_jobs_from_listing(job_page, candidate, options, deadline))
                 if len(discovered) >= self.max_jobs:
                     return discovered
         return discovered

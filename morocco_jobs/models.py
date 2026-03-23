@@ -71,6 +71,7 @@ class SearchOptions:
     watch: bool = False
     apply_template: bool = False
     deep_scan: bool = False
+    source_timeout_seconds: int = 90
 
 
 @dataclass(slots=True)
